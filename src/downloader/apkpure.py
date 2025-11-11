@@ -1,6 +1,8 @@
 """APK Pure Downloader Class."""
 
+from functools import cmp_to_key
 from typing import Any, Self
+from urllib.parse import parse_qs, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -33,30 +35,37 @@ class ApkPure(Downloader):
         """Specifically used to sort the arch list based on order of elements of default archs priority list."""
         return [darch for darch in self.default_archs_priority if darch in arch_list]
 
+    def _get_apk_type(self: Self, dl: str) -> list[str] | None:
+        """Extract apk type from download link."""
+        query_params = parse_qs(urlparse(dl).query)
+        return query_params.get("nc")
+
+    def _compare_apk_types(self: Self, apk_type1: list[str], apk_type2: list[str]) -> int:
+        """Compare two apk types for prioritization."""
+        l1, l2 = len(apk_type1), len(apk_type2)
+        if l1 != l2:
+            # Longer list indicates support for multiple archs, higher priority
+            return -1 if l1 > l2 else 1
+
+        # Same length, compare by priority order
+        priority = self.global_archs_priority or self.default_archs_priority
+        for arch in priority:
+            has_arch1 = arch in apk_type1
+            has_arch2 = arch in apk_type2
+            if has_arch1 != has_arch2:
+                return -1 if has_arch1 else 1
+        return 0
+
     def _compare_dls(self: Self, dl1: str, dl2: str) -> int:
         """Compare two dls of same type (apk or xapk) to prioritise the archs on lower indices."""
-        from urllib.parse import parse_qs, urlparse
+        apk_type1 = self._get_apk_type(dl1)
+        apk_type2 = self._get_apk_type(dl2)
 
-        apk_type1 = parse_qs(urlparse(dl1).query).get("nc")
-        apk_type2 = parse_qs(urlparse(dl2).query).get("nc")
         if apk_type1 and apk_type2:
-            l1 = len(apk_type1)
-            l2 = len(apk_type2)
-            # Indicates support for multiple archs, hence longer length
-            if l1 > l2:
-                return -1
-            if l1 < l2:
-                return 1
-            # Arrange based on priority list
-            priority = self.global_archs_priority or self.default_archs_priority
-            for arch in priority:
-                if arch in apk_type1 and arch not in apk_type2:
-                    return -1
-                if arch not in apk_type1 and arch in apk_type2:
-                    return 1
-        elif not apk_type1 and apk_type2:
+            return self._compare_apk_types(apk_type1, apk_type2)
+        if not apk_type1 and apk_type2:
             return 1
-        elif apk_type1 and not apk_type2:
+        if apk_type1 and not apk_type2:
             return -1
         return 0
 
@@ -67,8 +76,6 @@ class ApkPure(Downloader):
         :param app: Name of the app
         :return: Tuple of filename and app direct download link
         """
-        from functools import cmp_to_key
-
         logger.debug(f"Extracting download link from\n{page}")
         r = requests.get(page, headers=request_header, timeout=request_timeout)
         handle_request_response(r, page)
@@ -97,28 +104,52 @@ class ApkPure(Downloader):
         return file_name, app_dl
 
     def specific_version(self: Self, app: APP, version: str) -> tuple[str, str]:
-        """Function to download the specified version of app from apkpure.
+        """
+        Downloads the specified version of an app from APKPure.
 
-        :param app: Name of the application
-        :param version: Version of the application to download
-        :return: Tuple of filename and app direct download link
+        Parameters
+        ----------
+        app : APP
+            The application object containing metadata.
+        version : str
+            The specific version of the application to download.
+
+        Returns
+        -------
+        tuple[str, str]
+            A tuple containing:
+            - The filename of the downloaded APK.
+            - The direct download link of the APK.
+
+        Raises
+        ------
+        APKPureAPKDownloadError
+            If the specified version is not found.
         """
         self.global_archs_priority = tuple(self._sort_by_priority(app.archs_to_build))
-        version_page = app.download_source + "/versions"
-        r = requests.get(version_page, headers=request_header, timeout=request_timeout)
-        handle_request_response(r, version_page)
-        soup = BeautifulSoup(r.text, bs4_parser)
-        version_box_list = soup.select("ul.ver-wrap > *")
-        for box in version_box_list:
-            if (
-                (_data := box.select_one("a.ver_download_link"))
-                and (found_version := _data.get("data-dt-version"))
-                and found_version == version
-            ):
-                download_page = _data.get("href")
-                file_name, download_source = self.extract_download_link(download_page, app.app_name)  # type: ignore  # noqa: PGH003
+        version_page = f"{app.download_source}/versions"
+
+        response = requests.get(version_page, headers=request_header, timeout=request_timeout)
+        handle_request_response(response, version_page)
+
+        soup = BeautifulSoup(response.text, bs4_parser)
+
+        for box in soup.select("ul.ver-wrap > *"):
+            download_link = box.select_one("a.ver_download_link")
+            if not download_link:
+                continue
+
+            found_version = download_link.get("data-dt-version")
+            if found_version == version:
+                download_page = download_link.get("href")
+                file_name, download_source = self.extract_download_link(
+                    str(download_page),
+                    app.app_name,
+                )
+
                 app.app_version = self.app_version
                 logger.info(f"Guessed {app.app_version} for {app.app_name}")
+
                 self._download(download_source, file_name)
                 return file_name, download_source
         msg = f"Unable to find specific version '{version}' for {app} from version list"
